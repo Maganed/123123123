@@ -41,14 +41,13 @@ namespace features::movement {
 			return;
 		}
 
-		const auto& prestate = systems::g_prediction.pre( );
-
-		// Sole ground signal: entity flags from pre-prediction state.
-		// The old check_ground_probe used movement_services+56 as a pawn
-		// back-pointer; that offset drifts across builds and produced spurious
-		// "on ground" reads that ate the landing frame before the real landing.
-		const auto on_ground =
-			( prestate.flags & cstypes::entity_flags::on_ground ) != 0;
+		// Read ground flag directly from the entity flags field.
+		// Previously we used prestate.flags from the prediction system, but
+		// if that system mis-reads after an SDK refresh the flag is always 0
+		// and bhop clears the jump button on EVERY tick — making it do nothing.
+		const auto entity_flags = memory::read<std::uint32_t>(
+			local.pawn + SCHEMA( "C_BaseEntity", "m_fFlags"_hash ) );
+		const auto on_ground = ( entity_flags & static_cast<std::uint32_t>( cstypes::entity_flags::on_ground ) ) != 0;
 
 		const auto base = cmd->csgo_user_cmd.mutable_base( );
 
@@ -56,32 +55,28 @@ namespace features::movement {
 		{
 			++this->m_ticks_on_ground;
 
-			// Mark jump as a fresh press in all button-state fields so the
-			// server sees a new rising edge.
+			// Mark jump as newly pressed so the server sees a rising edge.
+			// Do NOT touch value_scroll — it is for scroll-wheel input only.
 			cmd->buttons.value         |= jump;
-			cmd->buttons.value_scroll  |= jump;
 			cmd->buttons.value_changed |= jump;
 
 			if ( base )
 			{
-				// CS2 jump processing is driven by per-subtick timestamps, not
-				// button flags.  Without an explicit subtick entry the engine
-				// chooses an arbitrary moment inside the tick that is usually
-				// outside the narrow landing window.
+				// The CS2 engine decides whether a jump succeeds by inspecting
+				// the subtick timestamp, not just the button flags.  We need an
+				// explicit jump subtick at when=0.0 (start of tick) so the engine
+				// sees the press right at the landing moment.
 				//
-				// Strategy:
-				//  1. If the player's physical input already created a jump
-				//     subtick, pin its timestamp to 0.0 (very start of tick).
-				//  2. Otherwise allocate a fresh entry via the project's own
-				//     acquire_subtick_step allocator (same path used by input.cpp
-				//     for analog deltas).  This properly handles arena memory and
-				//     RepT capacity, so the entry survives serialisation.
+				// 1. If the engine already created a jump subtick from physical
+				//    input, just pin its timestamp to 0.0.
+				// 2. Otherwise inject a fresh one via acquire_subtick_step(),
+				//    which is the project's own safe arena/capacity allocator.
 
 				bool found = false;
 				for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
 				{
-					if ( const auto step = base->mutable_subtick_moves( i );
-						 step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+					const auto step = base->mutable_subtick_moves( i );
+					if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
 					{
 						step->set_pressed( true );
 						step->set_when( 0.0f );
@@ -92,8 +87,9 @@ namespace features::movement {
 
 				if ( !found )
 				{
-					if ( const auto step = systems::g_input.acquire_subtick_step(
-							base->mutable_subtick_moves( ) ) )
+					const auto step = systems::g_input.acquire_subtick_step(
+						base->mutable_subtick_moves( ) );
+					if ( step )
 					{
 						step->set_button( static_cast<std::uint64_t>( jump ) );
 						step->set_pressed( true );
@@ -107,19 +103,18 @@ namespace features::movement {
 
 		this->m_ticks_on_ground = 0;
 
-		// Airborne: clear jump so the server sees a clean press edge on the
-		// next landing.  Convert any existing jump subtick into a release so
-		// the subtick list stays consistent with the button state.
+		// Airborne — suppress jump so the server sees a clean rising edge the
+		// moment we land next tick.  Also flip any lingering jump subtick to
+		// released so the subtick list stays consistent with the button state.
 		cmd->buttons.value         &= ~jump;
-		cmd->buttons.value_scroll  &= ~jump;
 		cmd->buttons.value_changed |= jump;
 
 		if ( base )
 		{
 			for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
 			{
-				if ( const auto step = base->mutable_subtick_moves( i );
-					 step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+				const auto step = base->mutable_subtick_moves( i );
+				if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
 				{
 					step->set_pressed( false );
 				}
