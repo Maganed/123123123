@@ -9,50 +9,6 @@
 
 namespace features::movement {
 
-	namespace {
-
-		[[nodiscard]] bool check_ground_probe(
-			std::uintptr_t local_pawn,
-			std::uintptr_t movement_services,
-			const systems::prediction::state& prestate,
-			float distance = 2.0f )
-		{
-			const auto pawn_ptr = memory::read<std::uintptr_t>( movement_services + 56 );
-			if ( !pawn_ptr )
-			{
-				return false;
-			}
-
-			const auto collision = local_pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash );
-			const auto mins = memory::read<math::vector3>( collision + SCHEMA( "CCollisionProperty", "m_vecMins"_hash ) );
-			const auto maxs = memory::read<math::vector3>( collision + SCHEMA( "CCollisionProperty", "m_vecMaxs"_hash ) );
-
-			auto trace_mask = memory::read<std::uintptr_t>( pawn_ptr + 0xd48 );
-			if ( memory::read<std::uint32_t>( pawn_ptr + 0x3f8 ) & 0x10 )
-			{
-				trace_mask |= 0x20;
-			}
-
-			const auto filter = systems::g_tracing.make_player_movement_filter( local_pawn, trace_mask, 11 );
-			const auto standable_convar = CONVAR( "sv_standable_normal" );
-			const auto standable_normal = standable_convar ? standable_convar->get<float>( ) : 0.7f;
-
-			const auto trace_start = prestate.networked_origin;
-			auto trace_end = trace_start;
-			trace_end.z -= distance;
-
-			const auto result = systems::g_tracing.trace_player_bbox(
-				trace_start,
-				trace_end,
-				{ mins, maxs },
-				filter,
-				movement_services );
-
-			return result.fraction < 1.0f && result.normal.z >= standable_normal;
-		}
-
-	} // namespace
-
 	void bhop::on_create_move( systems::input::usercmd* cmd )
 	{
 		constexpr auto jump = static_cast<std::uintptr_t>( cstypes::command_buttons::in_jump );
@@ -85,51 +41,80 @@ namespace features::movement {
 			return;
 		}
 
-		const auto movement_services = memory::read<std::uintptr_t>(
-			local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
-		if ( !movement_services )
-		{
-			this->m_ticks_on_ground = 0;
-			return;
-		}
-
 		const auto& prestate = systems::g_prediction.pre( );
-		const auto has_ground_flag =
+
+		// Use entity flags as the sole authoritative ground signal.
+		// The old check_ground_probe helper read movement_services+56 as a
+		// pawn back-pointer; that offset drifts across builds and produced
+		// spurious "on ground" decisions that ate landing frames.
+		const auto on_ground =
 			( prestate.flags & cstypes::entity_flags::on_ground ) != 0;
-		const auto falling_or_level = prestate.networked_velocity.z <= 0.0f;
-		const auto on_ground = has_ground_flag ||
-			( falling_or_level && check_ground_probe( local.pawn, movement_services, prestate ) );
+
+		const auto base = cmd->csgo_user_cmd.mutable_base( );
 
 		if ( on_ground )
 		{
 			++this->m_ticks_on_ground;
 
-			// Emit a fresh press on every detected landing. The airborne command
-			// below always emits the matching release transition.
-			cmd->buttons.value |= jump;
+			// Mark the jump button as freshly pressed in all button-state
+			// fields so the server sees a new edge.
+			cmd->buttons.value        |= jump;
 			cmd->buttons.value_scroll |= jump;
 			cmd->buttons.value_changed |= jump;
+
+			// CS2 uses per-subtick timestamps for jump processing.
+			// Without an explicit subtick step the engine picks an arbitrary
+			// moment inside the tick, which often misses the landing window.
+			// Inject a press at when=0.0 (very first subtick) and, if the
+			// player also sent a step from physical input, replace it.
+			if ( base )
+			{
+				bool replaced = false;
+				for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
+				{
+					const auto step = base->mutable_subtick_moves( i );
+					if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+					{
+						// Take over the existing slot: force press at tick start.
+						step->set_pressed( true );
+						step->set_when( 0.0f );
+						replaced = true;
+						break;
+					}
+				}
+
+				if ( !replaced )
+				{
+					// No existing jump subtick — synthesise one.
+					auto* step = base->add_subtick_moves( );
+					if ( step )
+					{
+						step->set_button( static_cast<std::uint64_t>( jump ) );
+						step->set_pressed( true );
+						step->set_when( 0.0f );
+					}
+				}
+			}
+
 			return;
 		}
 
 		this->m_ticks_on_ground = 0;
 
-		// A held physical key must become a released command while airborne;
-		// otherwise the server keeps the previous jump state and the next landing
-		// does not see a new press edge.
-		cmd->buttons.value &= ~jump;
+		// Airborne: release the jump button so the server sees a clean
+		// press edge on the next landing.  Convert any airborne subtick
+		// jump steps into releases.
+		cmd->buttons.value        &= ~jump;
 		cmd->buttons.value_scroll &= ~jump;
 		cmd->buttons.value_changed |= jump;
 
-		if ( const auto base = cmd->csgo_user_cmd.mutable_base( ) )
+		if ( base )
 		{
 			for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
 			{
-				if ( const auto step = base->mutable_subtick_moves( i );
-					step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+				const auto step = base->mutable_subtick_moves( i );
+				if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
 				{
-					// Keep the button identity and convert any airborne jump event
-					// into a release instead of leaving an invalid button-0 step.
 					step->set_pressed( false );
 				}
 			}
