@@ -517,7 +517,13 @@ namespace features::combat {
 				const auto future_offset = stop->eye - primary_eye;
 				auto planned_hits = scan_from_eye_candidates( future_offset, stop->inaccuracy );
 				const auto planned = this->select_best( ctx, planned_hits, stop->inaccuracy );
-				this->m_should_stop = planned.valid || best.valid;
+
+				// Fix: previously `best.valid` alone caused autostop any time a target
+				// existed in FOV regardless of hitchance. This made the player brake
+				// mid-peek and fire bad shots repeatedly. Now we only autostop if the
+				// planned shot is good, OR the current shot is at least halfway to
+				// required hitchance (close enough to be worth stopping for).
+				this->m_should_stop = planned.valid || ( best.valid && standing_hc >= needed_hc * 0.5f );
 
 				// Predictive peek autostop: extrapolate 1 tick forward along velocity
 				if ( !this->m_should_stop && ctx.on_ground && prestate.networked_velocity.length_2d( ) > 30.0f )
@@ -533,7 +539,7 @@ namespace features::combat {
 			}
 			else
 			{
-				this->m_should_stop = best.valid;
+				this->m_should_stop = best.valid && standing_hc >= needed_hc * 0.5f;
 			}
 
 			if ( this->m_should_stop )
@@ -1707,20 +1713,22 @@ namespace features::combat {
 			cmd->csgo_user_cmd.set_attack1_start_history_index( history_size - 1 );
 		}
 
-		math::vector3 forward{};
-		{
-			if ( const auto angles = base->viewangles( ) )
-			{
-				math::helpers::angle_vectors_left( { angles->x( ), angles->y( ), angles->z( ) }, &forward );
-			}
-		}
-
+		// BUG FIX: Previously forward was computed from base->viewangles() which contains
+		// the antiaim/command angles, not the actual shot direction. When anti-aim is active
+		// those angles point ~180 degrees away from the target, making facing_away = true on
+		// every single shot, rotating every bullet 180 degrees away from the enemy via hide_shots.
+		// Fix: compute forward from punched_aim (the real shot angle after recoil subtraction).
+		// Also use prestate.origin (absolute position) instead of networked_origin (network-lagged)
+		// to avoid spurious facing_away flips during fast movement.
 		const auto punched_aim = math::vector3{
 			std::clamp( aim_angle.x - aim_punch.x, -89.0f, 89.0f ),
 			math::helpers::normalize_yaw( aim_angle.y - aim_punch.y ),
 			config.no_spread.value ? math::helpers::normalize_yaw( aim_angle.z ) : 0.0f
 		};
-		const auto facing_away = forward.dot( ( tgt.hit.record->origin - systems::g_prediction.pre( ).networked_origin ).normalized( ) ) < 0.707107f;
+
+		math::vector3 forward{};
+		math::helpers::angle_vectors_left( punched_aim, &forward );
+		const auto facing_away = forward.dot( ( tgt.hit.record->origin - systems::g_prediction.pre( ).origin ).normalized( ) ) < 0.707107f;
 
 		auto command_aim = punched_aim;
 		if ( facing_away && settings::g_combat.m_antiaim.hide_shots.value )
