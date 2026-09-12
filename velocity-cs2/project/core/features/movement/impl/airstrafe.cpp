@@ -34,9 +34,6 @@ namespace features::movement {
 		const auto in_air =
 			( prestate.flags & cstypes::entity_flags::on_ground ) == 0;
 
-		// Reset all persistent steering state on the ground even while the
-		// feature is disabled. Keeping button history from the previous jump was
-		// responsible for stale left/right decisions on the next takeoff.
 		if ( !in_air )
 		{
 			this->m_air_ticks = 0;
@@ -68,14 +65,13 @@ namespace features::movement {
 			return;
 		}
 
-		if ( wants_stop || ( settings::g_movement.airstrafe.value && ( current_buttons & sprint ) ) )
+		if ( wants_stop || ( current_buttons & sprint ) )
 		{
 			this->rotate_to_stop( base, prestate.networked_velocity );
 			return;
 		}
 
 		++this->m_air_ticks;
-
 		this->check_button( current_buttons, moveleft );
 		this->check_button( current_buttons, moveright );
 		this->check_button( current_buttons, forward );
@@ -85,14 +81,8 @@ namespace features::movement {
 		auto yaw_offset = 0.0f;
 		if ( settings::g_movement.airstrafe_fully_directional.value )
 		{
-			if ( this->m_last_pressed & moveleft )
-			{
-				yaw_offset += 90.0f;
-			}
-			if ( this->m_last_pressed & moveright )
-			{
-				yaw_offset -= 90.0f;
-			}
+			if ( this->m_last_pressed & moveleft ) yaw_offset += 90.0f;
+			if ( this->m_last_pressed & moveright ) yaw_offset -= 90.0f;
 			if ( this->m_last_pressed & forward )
 			{
 				yaw_offset *= 0.5f;
@@ -125,21 +115,19 @@ namespace features::movement {
 		math::helpers::normalize_angle( target_delta );
 
 		const auto wishspeed_cvar = CONVAR( "sv_air_max_wishspeed" );
-		const auto max_wishspeed =
-			wishspeed_cvar ? wishspeed_cvar->get<float>( ) : 30.0f;
+		const auto max_wishspeed = wishspeed_cvar
+			? wishspeed_cvar->get<float>( )
+			: 30.0f;
 		const auto cos_theta = std::clamp(
-			max_wishspeed / std::max( speed_2d, 1.0f ), 0.0f, 1.0f );
+			max_wishspeed / ( 2.0f * std::max( speed_2d, 1.0f ) ), 0.0f, 1.0f );
 		const auto ideal_angle = std::acosf( cos_theta ) *
 			( 180.0f / std::numbers::pi_v<float> );
 
-		// Use hysteresis: tiny yaw noise must not switch the strafe side every
-		// command. A real mouse turn wins; otherwise steer toward the requested
-		// direction and retain the previous side inside the dead zone.
-		if ( std::fabsf( mouse_yaw_delta ) > 0.15f )
+		if ( std::fabsf( mouse_yaw_delta ) > 0.20f )
 		{
 			this->m_side_switch = mouse_yaw_delta > 0.0f;
 		}
-		else if ( std::fabsf( target_delta ) > 2.0f )
+		else if ( std::fabsf( target_delta ) > 3.0f )
 		{
 			this->m_side_switch = target_delta > 0.0f;
 		}
@@ -163,33 +151,26 @@ namespace features::movement {
 			side_move /= max_component;
 		}
 
-		base->set_forwardmove( std::clamp( forward_move, -1.0f, 1.0f ) );
-		base->set_leftmove( std::clamp( side_move, -1.0f, 1.0f ) );
+		const auto wanted_forward = std::clamp( forward_move, -1.0f, 1.0f );
+		const auto wanted_left = std::clamp( side_move, -1.0f, 1.0f );
+		base->set_forwardmove( wanted_forward );
+		base->set_leftmove( wanted_left );
 
-		const auto old_movement_buttons = cmd->buttons.value & movement_mask;
-		cmd->buttons.value &= ~movement_mask;
-		if ( base->forwardmove( ) > 0.01f )
-		{
-			cmd->buttons.value |= forward;
-		}
-		else if ( base->forwardmove( ) < -0.01f )
-		{
-			cmd->buttons.value |= back;
-		}
-		if ( base->leftmove( ) > 0.01f )
-		{
-			cmd->buttons.value |= moveleft;
-		}
-		else if ( base->leftmove( ) < -0.01f )
-		{
-			cmd->buttons.value |= moveright;
-		}
+		// Preserve the player's real W/A/S/D bits. Synthesizing alternating
+		// digital buttons made the animation state turn the legs left/right.
+		// Only the analog command is adjusted for the air movement itself.
 
-		// Publish movement transitions along with the analog values. Previously
-		// only buttonstate1 changed, so stale direction bits could survive on the
-		// receiving side and fight the new analog movement.
-		const auto new_movement_buttons = cmd->buttons.value & movement_mask;
-		cmd->buttons.value_changed |= old_movement_buttons ^ new_movement_buttons;
+		// Remove later physical analog deltas that would override the corrected
+		// movement during the same command. input::apply will publish the final
+		// delta in the initial subtick step.
+		for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
+		{
+			if ( const auto step = base->mutable_subtick_moves( i ) )
+			{
+				step->set_analog_forward_delta( 0.0f );
+				step->set_analog_left_delta( 0.0f );
+			}
+		}
 	}
 
 	void airstrafe::store_angles( )

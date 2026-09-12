@@ -37,17 +37,12 @@ namespace features::movement {
 			const auto standable_convar = CONVAR( "sv_standable_normal" );
 			const auto standable_normal = standable_convar ? standable_convar->get<float>( ) : 0.7f;
 
-			const auto trace_start = prestate.networked_origin;
+			const auto trace_start = prestate.origin;
 			auto trace_end = trace_start;
 			trace_end.z -= distance;
 
 			const auto result = systems::g_tracing.trace_player_bbox(
-				trace_start,
-				trace_end,
-				{ mins, maxs },
-				filter,
-				movement_services );
-
+				trace_start, trace_end, { mins, maxs }, filter, movement_services );
 			return result.fraction < 1.0f && result.normal.z >= standable_normal;
 		}
 
@@ -57,7 +52,17 @@ namespace features::movement {
 	{
 		constexpr auto jump = static_cast<std::uintptr_t>( cstypes::command_buttons::in_jump );
 
-		if ( !settings::g_movement.bhop.value || !( cmd->buttons.value & jump ) )
+		if ( !settings::g_movement.bhop.value )
+		{
+			this->m_ticks_on_ground = 0;
+			return;
+		}
+
+		// Do not use the command bit as the only hold signal. We deliberately
+		// clear that bit while airborne, and Source 2 can carry the cleared state
+		// into following commands until a new physical key edge occurs.
+		const auto space_held = ( GetAsyncKeyState( VK_SPACE ) & 0x8000 ) != 0;
+		if ( !space_held )
 		{
 			this->m_ticks_on_ground = 0;
 			return;
@@ -96,43 +101,21 @@ namespace features::movement {
 		const auto& prestate = systems::g_prediction.pre( );
 		const auto has_ground_flag =
 			( prestate.flags & cstypes::entity_flags::on_ground ) != 0;
-		const auto falling_or_level = prestate.networked_velocity.z <= 0.0f;
-		const auto on_ground = has_ground_flag ||
-			( falling_or_level && check_ground_probe( local.pawn, movement_services, prestate ) );
+		const auto near_ground = prestate.networked_velocity.z <= 0.0f &&
+			check_ground_probe( local.pawn, movement_services, prestate );
 
-		if ( on_ground )
+		if ( has_ground_flag || near_ground )
 		{
 			++this->m_ticks_on_ground;
-
-			// Emit a fresh press on every detected landing. The airborne command
-			// below always emits the matching release transition.
 			cmd->buttons.value |= jump;
-			cmd->buttons.value_scroll |= jump;
 			cmd->buttons.value_changed |= jump;
-			return;
 		}
-
-		this->m_ticks_on_ground = 0;
-
-		// A held physical key must become a released command while airborne;
-		// otherwise the server keeps the previous jump state and the next landing
-		// does not see a new press edge.
-		cmd->buttons.value &= ~jump;
-		cmd->buttons.value_scroll &= ~jump;
-		cmd->buttons.value_changed |= jump;
-
-		if ( const auto base = cmd->csgo_user_cmd.mutable_base( ) )
+		else
 		{
-			for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
-			{
-				if ( const auto step = base->mutable_subtick_moves( i );
-					step && step->button( ) == static_cast<std::uint64_t>( jump ) )
-				{
-					// Keep the button identity and convert any airborne jump event
-					// into a release instead of leaving an invalid button-0 step.
-					step->set_pressed( false );
-				}
-			}
+			this->m_ticks_on_ground = 0;
+			cmd->buttons.value &= ~jump;
+			cmd->buttons.value_scroll &= ~jump;
+			cmd->buttons.value_changed |= jump;
 		}
 	}
 
