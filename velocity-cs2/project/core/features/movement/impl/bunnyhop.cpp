@@ -50,48 +50,32 @@ namespace features::movement {
 		const auto on_ground =
 			( prestate.flags & cstypes::entity_flags::on_ground ) != 0;
 
-		const auto base = cmd->csgo_user_cmd.mutable_base( );
-
 		if ( on_ground )
 		{
 			++this->m_ticks_on_ground;
 
 			// Mark the jump button as freshly pressed in all button-state
 			// fields so the server sees a new edge.
-			cmd->buttons.value        |= jump;
-			cmd->buttons.value_scroll |= jump;
+			cmd->buttons.value         |= jump;
+			cmd->buttons.value_scroll  |= jump;
 			cmd->buttons.value_changed |= jump;
 
 			// CS2 uses per-subtick timestamps for jump processing.
 			// Without an explicit subtick step the engine picks an arbitrary
-			// moment inside the tick, which often misses the landing window.
-			// Inject a press at when=0.0 (very first subtick) and, if the
-			// player also sent a step from physical input, replace it.
-			if ( base )
+			// moment inside the tick, which often misses the narrow landing window.
+			// If the physical input already produced a jump subtick, pin its
+			// timestamp to 0.0 (very first subtick of the tick) so the press
+			// is processed as early as possible.
+			if ( const auto base = cmd->csgo_user_cmd.mutable_base( ) )
 			{
-				bool replaced = false;
 				for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
 				{
-					const auto step = base->mutable_subtick_moves( i );
-					if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+					if ( const auto step = base->mutable_subtick_moves( i );
+						 step && step->button( ) == static_cast<std::uint64_t>( jump ) )
 					{
-						// Take over the existing slot: force press at tick start.
 						step->set_pressed( true );
 						step->set_when( 0.0f );
-						replaced = true;
 						break;
-					}
-				}
-
-				if ( !replaced )
-				{
-					// No existing jump subtick — synthesise one.
-					auto* step = base->add_subtick_moves( );
-					if ( step )
-					{
-						step->set_button( static_cast<std::uint64_t>( jump ) );
-						step->set_pressed( true );
-						step->set_when( 0.0f );
 					}
 				}
 			}
@@ -104,16 +88,16 @@ namespace features::movement {
 		// Airborne: release the jump button so the server sees a clean
 		// press edge on the next landing.  Convert any airborne subtick
 		// jump steps into releases.
-		cmd->buttons.value        &= ~jump;
-		cmd->buttons.value_scroll &= ~jump;
+		cmd->buttons.value         &= ~jump;
+		cmd->buttons.value_scroll  &= ~jump;
 		cmd->buttons.value_changed |= jump;
 
-		if ( base )
+		if ( const auto base = cmd->csgo_user_cmd.mutable_base( ) )
 		{
 			for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
 			{
-				const auto step = base->mutable_subtick_moves( i );
-				if ( step && step->button( ) == static_cast<std::uint64_t>( jump ) )
+				if ( const auto step = base->mutable_subtick_moves( i );
+					 step && step->button( ) == static_cast<std::uint64_t>( jump ) )
 				{
 					step->set_pressed( false );
 				}
