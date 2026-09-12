@@ -1,0 +1,41 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Dependencies and environments
+node_modules/
+vendor/
+venv/
+.venv/
+
+# Build outputs and caches
+dist/
+build/
+.next/
+out/
+target/
+bin/
+obj/
+__pycache__/
+*.pyc
+.cache/
+coverage/
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Archives
+*.zip
+*.rar
+*.7z
